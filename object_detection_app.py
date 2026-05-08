@@ -1,6 +1,7 @@
 """
 Multi-Class Object Detection System (YOLOv8 + Streamlit)
 Supports: Image Upload + Live Webcam modes + Scene Understanding
+Uses streamlit-webrtc for browser-compatible webcam access.
 """
 
 import streamlit as st
@@ -9,7 +10,10 @@ import numpy as np
 from ultralytics import YOLO
 import json
 import time
+import threading
+import av
 from collections import Counter
+from streamlit_webrtc import webrtc_streamer, WebRtcMode, VideoProcessorBase
 from scene_classifier import classify_scene, get_scene_overlay_text
 
 # ── Page Config ──
@@ -542,8 +546,7 @@ def render_detection_list(filtered):
             f'<span class="det-badge {bc}">[{b["x1"]},{b["y1"]}]-[{b["x2"]},{b["y2"]}]</span></div>', unsafe_allow_html=True)
 
 # ── Session State Init ──
-if "webcam_running" not in st.session_state:
-    st.session_state.webcam_running = False
+# (webcam state is now managed by streamlit-webrtc)
 
 # ── Sidebar ──
 with st.sidebar:
@@ -565,8 +568,7 @@ with st.sidebar:
     if input_mode == "📹 Live Webcam":
         st.markdown("---")
         st.markdown("### 📹 Webcam Settings")
-        frame_skip = st.slider("⏭️ Process every Nth frame", 1, 10, 2, help="Higher = faster UI, fewer detections")
-        resize_width = st.slider("📐 Frame width (px)", 320, 1280, 640, 80, help="Smaller = faster inference")
+        st.markdown("<small style='color:rgba(255,255,255,.45);'>Camera uses your <strong>browser webcam</strong> via WebRTC</small>", unsafe_allow_html=True)
     st.markdown("---")
     st.markdown("<div style='text-align:center;color:rgba(255,255,255,.35);font-size:.75rem;'>YOLOv8 + COCO · 80 classes</div>", unsafe_allow_html=True)
 
@@ -654,95 +656,125 @@ if input_mode == "📤 Upload Image":
                 '<p style="color:rgba(255,255,255,.4);font-size:.85rem;">Auto-generated scene summaries</p></div>', unsafe_allow_html=True)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# MODE 2: LIVE WEBCAM
+# MODE 2: LIVE WEBCAM (streamlit-webrtc)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 elif input_mode == "📹 Live Webcam":
 
-    # Control buttons
-    btn_col1, btn_col2, _ = st.columns([1, 1, 3])
-    with btn_col1:
-        start_btn = st.button("▶️ Start Webcam", use_container_width=True, type="primary")
-    with btn_col2:
-        stop_btn = st.button("⏹️ Stop Webcam", use_container_width=True)
+    # ── Video Processor class for per-frame YOLO inference ──
+    # NOTE: Places365 scene classification is DISABLED in webcam mode
+    #       to keep CPU usage low on Streamlit Cloud.  Scene analysis
+    #       remains fully available in Upload Image mode.
+    class YOLOv8VideoProcessor(VideoProcessorBase):
+        """Lightweight webcam processor — YOLOv8n detection only.
+        No Places365 scene classification to maximise FPS on Cloud."""
 
-    if start_btn:
-        st.session_state.webcam_running = True
-    if stop_btn:
-        st.session_state.webcam_running = False
+        def __init__(self):
+            # Always use nano model for webcam (fastest inference)
+            self._model = load_model("yolov8n")
+            self._confidence = confidence_threshold
+            self._filter_mode = filter_mode
+            self._lock = threading.Lock()
+            # Shared results for the main thread
+            self.result_detections: list = []
+            self.result_filtered: list = []
+            self.result_elapsed_ms: float = 0.0
+            self._frame_count = 0
+            # Cache last annotated frame for skipped frames
+            self._last_annotated = None
 
-    if st.session_state.webcam_running:
-        st.markdown('<div class="webcam-status webcam-live">🔴 LIVE — Webcam Active</div>', unsafe_allow_html=True)
+        def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+            """Called for every incoming video frame from the browser webcam."""
+            img = frame.to_ndarray(format="bgr24")
+            self._frame_count += 1
 
-        with st.spinner(f"Loading {model_size} model..."):
-            model = load_model(model_size)
+            # Resize for performance (480px wide — lighter than 640)
+            h, w = img.shape[:2]
+            target_w = 480
+            scale = target_w / w
+            img_resized = cv2.resize(img, (target_w, int(h * scale)))
 
-        # Placeholders for live updates
-        frame_placeholder = st.empty()
-        metrics_placeholder = st.empty()
-        scene_placeholder = st.empty()
-        list_placeholder = st.empty()
+            # Run YOLO detection on every 3rd frame to maximise FPS
+            if self._frame_count % 3 == 0:
+                detections, elapsed_ms = run_detection(
+                    self._model, img_resized, self._confidence
+                )
+                filtered = filter_detections(detections, self._filter_mode)
 
-        cap = cv2.VideoCapture(0)
-        if not cap.isOpened():
-            st.error("❌ Cannot access webcam. Please check your camera permissions and try again.")
-            st.session_state.webcam_running = False
-            st.stop()
+                # No scene classification — set to None for performance
+                scene_result = None
+                scene_overlay = None
 
-        frame_count = 0
-        try:
-            while st.session_state.webcam_running:
-                ret, frame = cap.read()
-                if not ret:
-                    st.warning("⚠️ Failed to read frame from webcam.")
-                    break
+                annotated = annotate_image(img_resized, filtered, scene_overlay)
 
-                frame_count += 1
+                # Share results with the main Streamlit thread
+                with self._lock:
+                    self.result_detections = detections
+                    self.result_filtered = filtered
+                    self.result_elapsed_ms = elapsed_ms
+                self._last_annotated = annotated
+            else:
+                # On skipped frames, re-draw with cached detections
+                with self._lock:
+                    filtered = list(self.result_filtered)
+                if filtered:
+                    annotated = annotate_image(img_resized, filtered, None)
+                elif self._last_annotated is not None:
+                    annotated = self._last_annotated
+                else:
+                    annotated = img_resized
 
-                # Resize for performance
-                h, w = frame.shape[:2]
-                scale = resize_width / w
-                frame_resized = cv2.resize(frame, (resize_width, int(h * scale)))
+            return av.VideoFrame.from_ndarray(annotated, format="bgr24")
 
-                # Only run detection on every Nth frame
-                if frame_count % frame_skip == 0:
-                    detections, elapsed_ms = run_detection(model, frame_resized, confidence_threshold)
-                    filtered = filter_detections(detections, filter_mode)
+    # ── Instruction banner ──
+    st.markdown(
+        '<div class="webcam-status webcam-live">'
+        '📹 Allow browser camera access when prompted · Detection runs in real-time'
+        '</div>', unsafe_allow_html=True)
 
-                    # Scene classification
-                    scene_result = classify_scene(detections, frame_resized)
-                    scene_overlay = get_scene_overlay_text(scene_result)
+    # ── TURN server config for Streamlit Cloud (NAT traversal) ──
+    RTC_CONFIGURATION = {
+        "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
+    }
 
-                    annotated = annotate_image(frame_resized, filtered, scene_overlay)
-                    annotated_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
+    # ── Launch the WebRTC streamer ──
+    ctx = webrtc_streamer(
+        key="yolov8-live-detection",
+        mode=WebRtcMode.SENDRECV,
+        rtc_configuration=RTC_CONFIGURATION,
+        video_processor_factory=YOLOv8VideoProcessor,
+        media_stream_constraints={"video": True, "audio": False},
+        async_processing=True,
+    )
 
-                    # Update frame
-                    frame_placeholder.image(annotated_rgb, caption=f"Live Feed — {elapsed_ms:.0f}ms | {scene_result['scene_label']}", use_container_width=True)
+    # ── Display live metrics & detection list below the video ──
+    if ctx.state.playing and ctx.video_processor:
+        processor = ctx.video_processor
+        # Read shared results from the processor (no scene data in webcam mode)
+        with processor._lock:
+            filtered = list(processor.result_filtered)
+            elapsed_ms = processor.result_elapsed_ms
 
-                    # Update metrics
-                    with metrics_placeholder.container():
-                        render_metrics(filtered, elapsed_ms)
+        if filtered:
+            render_metrics(filtered, elapsed_ms)
+            summary = generate_scene_summary(filtered)
+            st.markdown(
+                f'<div class="scene-box">🌄 <strong>Object Summary:</strong> {summary}</div>',
+                unsafe_allow_html=True)
+            with st.expander("📋 Detection List", expanded=False):
+                render_detection_list(filtered)
 
-                    # Update scene summary with fusion
-                    with scene_placeholder.container():
-                        render_scene_card(scene_result)
-
-                    # Update detection list
-                    with list_placeholder.container():
-                        render_detection_list(filtered)
-
-                # Small sleep to prevent UI freeze
-                time.sleep(0.03)
-
-        except Exception as e:
-            st.error(f"❌ Webcam error: {e}")
-        finally:
-            cap.release()
-            st.session_state.webcam_running = False
-
+        st.markdown(
+            '<div style="text-align:center;color:rgba(255,255,255,.35);font-size:.8rem;margin-top:.5rem;">'
+            'Detections update in real-time · Scene classification available in Upload mode</div>',
+            unsafe_allow_html=True)
     else:
-        st.markdown('<div class="webcam-status webcam-off">⏹️ Webcam Stopped</div>', unsafe_allow_html=True)
-        st.markdown('<div class="glass-card" style="text-align:center;padding:4rem 2rem;">'
+        st.markdown(
+            '<div class="glass-card" style="text-align:center;padding:4rem 2rem;">'
             '<p style="font-size:3rem;margin-bottom:.5rem;">📹</p>'
-            '<p style="color:rgba(255,255,255,.5);font-size:1.1rem;">Click <strong>Start Webcam</strong> to begin live detection</p>'
+            '<p style="color:rgba(255,255,255,.5);font-size:1.1rem;">'
+            'Click <strong>START</strong> above to begin live detection</p>'
+            '<p style="color:rgba(255,255,255,.3);font-size:.85rem;">'
+            'Uses your browser webcam via WebRTC · YOLOv8n · 80 COCO classes</p></div>',
+            unsafe_allow_html=True)
             '<p style="color:rgba(255,255,255,.3);font-size:.85rem;">Uses the same YOLOv8 model • Adjustable frame rate & resolution</p></div>', unsafe_allow_html=True)
